@@ -1,0 +1,1 @@
+jpackage --input target --name EchoLAN --main-jar echolan-1.0-SNAPSHOT.jar --main-class com.robustians.echolan.App --type exe --win-console
