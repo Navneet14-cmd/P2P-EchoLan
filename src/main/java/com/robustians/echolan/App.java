@@ -19,6 +19,10 @@ import com.robustians.echolan.model.*;
 import com.robustians.encoding.Bip39Handler;
 import com.robustians.utils.CLI;
 import com.robustians.utils.NetworkSelector;
+import javax.crypto.SecretKey;
+import java.security.KeyPair;
+import java.security.PublicKey;
+import com.robustians.echolan.crypto.CryptoEngine;
 
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
@@ -50,6 +54,7 @@ public class App {
 
     private static final int MAX_MESSAGE_HISTORY = 1000;
     private static MessageRepository messageRepository;
+    private static SecretKey aesKey;
 
     private static void safePrintln(String msg) {
         synchronized (PRINT_LOCK) {
@@ -172,14 +177,15 @@ public class App {
                     .option(LineReader.Option.INSERT_TAB, true)
                     .build();
 
-            initiateChatSession(chatReader);
+            boolean isServer = connected.get();
+            initiateChatSession(chatReader, isServer);
 
         } catch (UserInterruptException | EndOfFileException e) {
             cleanupAndExit();
         }
     }
 
-    private static void initiateChatSession(LineReader reader) throws IOException {
+    private static void initiateChatSession(LineReader reader, boolean isServer) throws IOException {
         BufferedReader in = new BufferedReader(
                 new InputStreamReader(clientSocket.getInputStream()));
         PrintWriter out = new PrintWriter(
@@ -187,6 +193,49 @@ public class App {
 
         String remoteHostAddress = clientSocket.getInetAddress().getHostAddress();
         currentPeerId = remoteHostAddress;
+
+        // Perform secure handshake
+        try {
+            safePrintln("\n" + YELLOW + "[Security] Performing secure handshake..." + END);
+
+            // 1. Generate local RSA key pair
+            KeyPair localRsaKeyPair = CryptoEngine.generateRsaKeyPair();
+            String localPubKeyB64 = CryptoEngine.encodePublicKey(localRsaKeyPair.getPublic());
+
+            // 2. Transmit local public key
+            out.println("INIT_PUBKEY:" + localPubKeyB64);
+
+            // 3. Receive peer's public key
+            String peerPubKeyLine = in.readLine();
+            if (peerPubKeyLine == null || !peerPubKeyLine.startsWith("INIT_PUBKEY:")) {
+                throw new IOException("Handshake failed: Did not receive valid remote public key");
+            }
+            String peerPubKeyB64 = peerPubKeyLine.substring(12);
+            PublicKey peerPublicKey = CryptoEngine.decodePublicKey(peerPubKeyB64);
+
+            // 4. Exchange session key
+            if (!isServer) {
+                // Client generates, encrypts and transmits AES key
+                aesKey = CryptoEngine.generateAesKey();
+                String encryptedAesKey = CryptoEngine.encryptAesKey(aesKey, peerPublicKey);
+                out.println("INIT_SESSIONKEY:" + encryptedAesKey);
+            } else {
+                // Server waits for the encrypted AES key and decrypts it
+                String sessionKeyLine = in.readLine();
+                if (sessionKeyLine == null || !sessionKeyLine.startsWith("INIT_SESSIONKEY:")) {
+                    throw new IOException("Handshake failed: Did not receive valid encrypted session key");
+                }
+                String encryptedAesKey = sessionKeyLine.substring(16);
+                aesKey = CryptoEngine.decryptAesKey(encryptedAesKey, localRsaKeyPair.getPrivate());
+            }
+
+            safePrintln(GREEN + "[Security] Secure session established using AES-256-GCM." + END);
+            Thread.sleep(1000); // Let the user see the success message briefly
+        } catch (Exception e) {
+            safePrintln(RED + "\n[Security] Handshake failed: " + e.getMessage() + END);
+            cleanupAndExit();
+            return;
+        }
 
         // Reload only this peer's history
         if (messageRepository != null) {
@@ -199,18 +248,37 @@ public class App {
         // 🔹 Incoming thread
         new Thread(() -> {
             try {
-                String message;
+                String rawLine;
 
-                while ((message = in.readLine()) != null) {
+                while ((rawLine = in.readLine()) != null) {
 
-                    // 🔥 Handle remote exit
-                    if (message.equalsIgnoreCase(".exit")) {
+                    // 🔥 Handle remote exit (plaintext check as fallback)
+                    if (rawLine.equalsIgnoreCase(".exit")) {
                         System.out.println(RED + "Peer disconnected!" + END);
                         cleanupAndExit();
                     }
 
-                    if (message.startsWith(".image ")) {
-                        String base64Image = message.substring(7).trim();
+                    String decryptedMessage;
+                    if (rawLine.startsWith("SECURE_MSG:")) {
+                        try {
+                            decryptedMessage = CryptoEngine.decryptMessage(rawLine.substring(11), aesKey);
+                        } catch (Exception e) {
+                            System.out.println(RED + "Failed to decrypt incoming message!" + END);
+                            continue;
+                        }
+                    } else {
+                        // Ignore unencrypted traffic during secure session
+                        continue;
+                    }
+
+                    // Check if decrypted message is remote exit command
+                    if (decryptedMessage.equalsIgnoreCase(".exit")) {
+                        System.out.println(RED + "Peer disconnected!" + END);
+                        cleanupAndExit();
+                    }
+
+                    if (decryptedMessage.startsWith(".image ")) {
+                        String base64Image = decryptedMessage.substring(7).trim();
                         showImage(base64Image);
 
                         synchronized (messages) {
@@ -226,7 +294,7 @@ public class App {
                     }
 
                     synchronized (messages) {
-                        Message msgObj = new Message(MSG_REMOTE, message, currentPeerId);
+                        Message msgObj = new Message(MSG_REMOTE, decryptedMessage, currentPeerId);
                         messages.add(msgObj);
                         if (messageRepository != null) {
                             messageRepository.save(msgObj);
@@ -263,7 +331,12 @@ public class App {
 
             // 🔥 LOCAL EXIT
             if (message.equalsIgnoreCase(".exit")) {
-                out.println(".exit");
+                try {
+                    String encryptedExit = CryptoEngine.encryptMessage(".exit", aesKey);
+                    out.println("SECURE_MSG:" + encryptedExit);
+                } catch (Exception ignored) {
+                }
+                out.println(".exit"); // Send plaintext exit as fallback/extra signal
                 cleanupAndExit();
                 return;
             }
@@ -294,10 +367,12 @@ public class App {
                         }
                     }
 
-                    out.println(".image " + base64Image);
+                    String imageMessage = ".image " + base64Image;
+                    String encryptedImageMessage = CryptoEngine.encryptMessage(imageMessage, aesKey);
+                    out.println("SECURE_MSG:" + encryptedImageMessage);
                     continue;
-                } catch (IOException e) {
-                    messages.add(new Message(MSG_LOCAL, RED + "Failed to encode image!" + END));
+                } catch (Exception e) {
+                    messages.add(new Message(MSG_LOCAL, RED + "Failed to encrypt/send image!" + END));
                     continue;
                 }
             }
@@ -310,7 +385,12 @@ public class App {
                 }
             }
 
-            out.println(message);
+            try {
+                String encryptedMsg = CryptoEngine.encryptMessage(message, aesKey);
+                out.println("SECURE_MSG:" + encryptedMsg);
+            } catch (Exception e) {
+                messages.add(new Message(MSG_LOCAL, RED + "Failed to encrypt message!" + END));
+            }
             redraw(remoteHostAddress);
         }
     }
